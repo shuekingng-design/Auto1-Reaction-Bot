@@ -15,43 +15,61 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// ----- Shared config -----
+// ---------- Shared config ----------
 const Reactions = splitEmojis(process.env.EMOJI_LIST);
 const RestrictedChats = getChatIds(process.env.RESTRICTED_CHATS);
 const RandomLevel = parseInt(process.env.RANDOM_LEVEL || '0', 10);
 
-// ----- Helpers -----
-const parseTokens = (raw) =>
-  (raw || '')
+// ---------- Helpers ----------
+const parseList = (raw = '') =>
+  raw
     .split(',')
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
-const botTokenSingle = process.env.BOT_TOKEN;                       // legacy single-bot
-const tokens = parseTokens(process.env.BOT_TOKENS);                 // multi-bot (comma-separated)
-const usernames = parseTokens(process.env.BOT_USERNAMES || '');     // optional, same order as BOT_TOKENS
+// Remove BOM/quotes/odd characters that sometimes creep in when tokens are copy–pasted
+const cleanToken = (t = '') =>
+  t
+    .replace(/\uFEFF/g, '')                 // remove BOM
+    .replace(/[“”‘’]/g, '"')                // normalize smart quotes
+    .replace(/^[\s"'`]+|[\s"'`]+$/g, '')    // trim quotes/whitespace around
+    .trim();
+
+const botTokenSingle = process.env.BOT_TOKEN;                  // legacy single-bot
+const tokensRaw = parseList(process.env.BOT_TOKENS || '');     // multi-bot (comma-separated)
+const usernamesRaw = parseList(process.env.BOT_USERNAMES || '');// optional, same order as BOT_TOKENS
 
 // Build a map: botId (digits before colon) -> { token, username, api }
 const multiBotMap = new Map();
-for (let i = 0; i < tokens.length; i++) {
-  const token = tokens[i];
-  const m = token.match(/^(\d+):/);
+tokensRaw.forEach((raw, i) => {
+  const token = cleanToken(raw);
+
+  // Be tolerant: find "<digits>:" anywhere (not only at the very beginning)
+  const m = token.match(/(\d+):/);
   if (!m) {
-    console.error('❌ Invalid BOT_TOKENS entry (missing <id>: prefix):', token.slice(0, 16) + '…');
-    continue;
+    console.error('❌ Skipping invalid BOT_TOKENS entry:', JSON.stringify(raw));
+    return;
   }
+
   const botId = m[1];
-  const username = usernames[i] || process.env.BOT_USERNAME || '';
+  const username = usernamesRaw[i] || process.env.BOT_USERNAME || '';
+
+  // Avoid accidental duplicates
+  if (multiBotMap.has(botId)) {
+    console.warn(`⚠️ Duplicate botId ${botId} in BOT_TOKENS; keeping the first occurrence.`);
+    return;
+  }
+
   multiBotMap.set(botId, {
     token,
     username,
     api: new TelegramBotAPI(token),
   });
-}
+});
 
 const multiMode = multiBotMap.size > 0;
 
-// ----- Webhook handlers -----
+// ---------- Routes ----------
 // Legacy single-bot route (POST /) keeps old deployments working
 if (botTokenSingle && !multiMode) {
   const botApi = new TelegramBotAPI(botTokenSingle);
@@ -75,7 +93,9 @@ app.post('/webhook/:botId', async (req, res) => {
   const { botId } = req.params;
   const entry = multiBotMap.get(botId);
   if (!entry) {
-    console.warn('⚠️ Unknown botId in webhook:', botId);
+    console.warn(
+      `⚠️ Unknown botId in webhook: ${botId}. Known IDs: [${Array.from(multiBotMap.keys()).join(', ')}]`
+    );
     return res.status(404).send('Unknown bot');
   }
 
@@ -88,8 +108,12 @@ app.post('/webhook/:botId', async (req, res) => {
   }
 });
 
-// Health & root
+// Sometimes it’s handy to hit this URL manually in a browser
+app.get('/webhook/:botId', (req, res) => res.status(200).send('Ok'));
+
+// Health & debug
 app.get('/', (_req, res) => res.send(htmlContent));
+
 app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
@@ -97,11 +121,21 @@ app.get('/health', (_req, res) => {
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development',
     mode: multiMode ? 'multi-bot' : 'single-bot',
-    bots: multiMode ? Array.from(multiBotMap.keys()) : []
+    bots: multiMode ? Array.from(multiBotMap.keys()) : [],
   });
 });
 
-// Start server
+// Extra: shows exactly what the server loaded (great for troubleshooting)
+app.get('/debug', (_req, res) => {
+  res.status(200).json({
+    mode: multiMode ? 'multi-bot' : 'single-bot',
+    knownIds: Array.from(multiBotMap.keys()),
+    hasTokensEnv: !!process.env.BOT_TOKENS,
+    tokensEnvLength: (process.env.BOT_TOKENS || '').length,
+  });
+});
+
+// ---------- Start server ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
