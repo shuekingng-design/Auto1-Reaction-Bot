@@ -35,9 +35,9 @@ const cleanToken = (t = '') =>
     .replace(/^[\s"'`]+|[\s"'`]+$/g, '')    // trim quotes/whitespace around
     .trim();
 
-const botTokenSingle = process.env.BOT_TOKEN;                  // legacy single-bot
-const tokensRaw = parseList(process.env.BOT_TOKENS || '');     // multi-bot (comma-separated)
-const usernamesRaw = parseList(process.env.BOT_USERNAMES || '');// optional, same order as BOT_TOKENS
+const botTokenSingle = process.env.BOT_TOKEN;                   // legacy single-bot
+const tokensRaw     = parseList(process.env.BOT_TOKENS || '');  // multi-bot (comma-separated)
+const usernamesRaw  = parseList(process.env.BOT_USERNAMES || '');// optional, same order as BOT_TOKENS
 
 // Build a map: botId (digits before colon) -> { token, username, api }
 const multiBotMap = new Map();
@@ -69,81 +69,56 @@ tokensRaw.forEach((raw, i) => {
 
 const multiMode = multiBotMap.size > 0;
 
-// ---------- Routes ----------
-// Legacy single-bot route (POST /) keeps old deployments working
-if (botTokenSingle && !multiMode) {
-  const botApi = new TelegramBotAPI(botTokenSingle);
-  const botUsername = process.env.BOT_USERNAME || '';
+// ---------- Webhook self-check (startup + /check) ----------
 
-  app.post('/', async (req, res) => {
-    try {
-      await onUpdate(req.body, botApi, Reactions, RestrictedChats, botUsername, RandomLevel);
-      res.status(200).send('Ok');
-    } catch (error) {
-      console.error('Error in onUpdate (single):', error.message);
-      res.status(200).send('Ok');
+/**
+ * Returns { ok, url, pending, lastError } or { ok:false, error }
+ */
+async function getWebhookInfo(token, abortSignal) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${token}/getWebhookInfo`, {
+      method: 'GET',
+      signal: abortSignal,
+    });
+    const data = await r.json();
+    if (!data || data.ok !== true) {
+      return { ok: false, error: 'Telegram replied not ok', raw: data };
     }
-  });
+    const info = data.result || {};
+    return {
+      ok: true,
+      url: info.url || '',
+      pending: info.pending_update_count || 0,
+      lastError: info.last_error_message || '',
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
 }
 
-// Multi-bot route: Telegram should POST to /webhook/<botId>
-app.post('/webhook/:botId', async (req, res) => {
-  if (!multiMode) return res.status(404).send('Multi-bot not configured');
-
-  const { botId } = req.params;
-  const entry = multiBotMap.get(botId);
-  if (!entry) {
-    console.warn(
-      `⚠️ Unknown botId in webhook: ${botId}. Known IDs: [${Array.from(multiBotMap.keys()).join(', ')}]`
-    );
-    return res.status(404).send('Unknown bot');
+/**
+ * Checks each configured bot’s webhook points to /webhook/<id>.
+ * Logs clear hints if a mismatch is found.
+ */
+async function checkAllWebhooks(reason = 'startup') {
+  if (!multiMode) {
+    console.log('Webhook check skipped (single-bot mode).');
+    return [];
   }
 
-  try {
-    await onUpdate(req.body, entry.api, Reactions, RestrictedChats, entry.username, RandomLevel);
-    res.status(200).send('Ok');
-  } catch (error) {
-    console.error(`Error in onUpdate [${botId}]:`, error.message);
-    res.status(200).send('Ok');
-  }
-});
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
 
-// Sometimes it’s handy to hit this URL manually in a browser
-app.get('/webhook/:botId', (req, res) => res.status(200).send('Ok'));
+  const checks = await Promise.allSettled(
+    Array.from(multiBotMap.entries()).map(async ([botId, { token }]) => {
+      const info = await getWebhookInfo(token, controller.signal);
+      const expectPath = `/webhook/${botId}`;
+      const result = {
+        botId,
+        expectPath,
+        ok: false,
+        info,
+      };
 
-// Health & debug
-app.get('/', (_req, res) => res.send(htmlContent));
-
-app.get('/health', (_req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    mode: multiMode ? 'multi-bot' : 'single-bot',
-    bots: multiMode ? Array.from(multiBotMap.keys()) : [],
-  });
-});
-
-// Extra: shows exactly what the server loaded (great for troubleshooting)
-app.get('/debug', (_req, res) => {
-  res.status(200).json({
-    mode: multiMode ? 'multi-bot' : 'single-bot',
-    knownIds: Array.from(multiBotMap.keys()),
-    hasTokensEnv: !!process.env.BOT_TOKENS,
-    tokensEnvLength: (process.env.BOT_TOKENS || '').length,
-  });
-});
-
-// ---------- Start server ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-  if (multiMode) {
-    console.log(`==> Multi-bot active for IDs: ${Array.from(multiBotMap.keys()).join(', ')}`);
-  } else if (botTokenSingle) {
-    console.log('==> Single-bot mode active');
-  } else {
-    console.log('⚠️ No bot token(s) configured');
-  }
-});
+      if (!info.ok) {
+        console.warn(`⚠️ [${reason}] bot ${botId}:
